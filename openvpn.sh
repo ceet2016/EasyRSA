@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
-
-
 # Detect Debian users running the script with "sh" instead of bash
 if readlink /proc/$$/exe | grep -qs "dash"; then
 	echo "这个脚本需要使用bash运行，而不是sh"
@@ -238,7 +236,7 @@ else
 	fi
 	yum install -y lrzsz
 	# Get easy-rsa
-	wget -O ~/EasyRSA-3.0.4.tgz "https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.4/EasyRSA-3.0.4.tgz"
+	wget -O ~/EasyRSA-3.0.4.tgz "https://cnb.cool/uniomo/EasyRSA/-/git/raw/main/EasyRSA-3.0.4.tgz"
 	tar xzf ~/EasyRSA-3.0.4.tgz -C ~/
 	mv ~/EasyRSA-3.0.4/ /etc/openvpn/
 	mv /etc/openvpn/EasyRSA-3.0.4/ /etc/openvpn/easy-rsa/
