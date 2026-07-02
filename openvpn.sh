@@ -54,10 +54,16 @@ newclient () {
 # Try to get our IP from the system and fallback to the Internet.
 # I do this to make the script compatible with NATed servers (lowendspirit.com)
 # and to avoid getting an IPv6.
+# Get the PRIMARY interface IP (used for SNAT/NAT rules)
 IP=$(ip addr | grep 'inet' | grep -v inet6 | grep -vE '127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -o -E '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
 if [[ "$IP" = "" ]]; then
 		IP=$(wget -4qO- "ipv4.icanhazip.com/")
 # 		IP='curl ipv4.icanhazip.com'
+fi
+# Get the external/public IP for client config (may differ from $IP on cloud NAT)
+EXTERNALIP=$(wget -4qO- "ipv4.icanhazip.com/" 2>/dev/null)
+if [[ "$EXTERNALIP" = "" ]]; then
+	EXTERNALIP=$IP
 fi
 
 if [[ -e /etc/openvpn/server.conf ]]; then
@@ -134,17 +140,17 @@ if [[ -e /etc/openvpn/server.conf ]]; then
 					firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
 					firewall-cmd --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
 				else
-					IP=$(grep 'iptables -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to ' $RCLOCAL | cut -d " " -f 14)
-					iptables -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
+					iptables -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j MASQUERADE 2>/dev/null
+					sed -i '/iptables -t nat -A POSTROUTING -s 10.8.0.0\/24 ! -d 10.8.0.0\/24 -j MASQUERADE/d' $RCLOCAL
+					# Also clean up old SNAT-style rules
+					iptables -t nat -D POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to 2>/dev/null
 					sed -i '/iptables -t nat -A POSTROUTING -s 10.8.0.0\/24 ! -d 10.8.0.0\/24 -j SNAT --to /d' $RCLOCAL
-					if iptables -L -n | grep -qE '^ACCEPT'; then
-						iptables -D INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
-						iptables -D FORWARD -s 10.8.0.0/24 -j ACCEPT
-						iptables -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-						sed -i "/iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT/d" $RCLOCAL
-						sed -i "/iptables -I FORWARD -s 10.8.0.0\/24 -j ACCEPT/d" $RCLOCAL
-						sed -i "/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT/d" $RCLOCAL
-					fi
+					iptables -D INPUT -p $PROTOCOL --dport $PORT -j ACCEPT 2>/dev/null
+					iptables -D FORWARD -s 10.8.0.0/24 -j ACCEPT 2>/dev/null
+					iptables -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+					sed -i "/iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT/d" $RCLOCAL
+					sed -i "/iptables -I FORWARD -s 10.8.0.0\/24 -j ACCEPT/d" $RCLOCAL
+					sed -i "/iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT/d" $RCLOCAL
 				fi
 				if hash sestatus 2>/dev/null; then
 					if sestatus | grep "Current mode" | grep -qs "enforcing"; then
@@ -283,8 +289,11 @@ ifconfig-pool-persist ipp.txt" > /etc/openvpn/server.conf
 			RESOLVCONF='/etc/resolv.conf'
 		fi
 		# Obtain the resolvers from resolv.conf and use them for OpenVPN
+		# Skip local/loopback DNS servers (e.g. 127.0.0.53) as they are unreachable from clients
 		grep -v '#' $RESOLVCONF | grep 'nameserver' | grep -E -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | while read line; do
-			echo "push \"dhcp-option DNS $line\"" >> /etc/openvpn/server.conf
+			if [[ "$line" != "127.0.0.1" && "$line" != "127.0.0.53" && "$line" != "127.0.0.54" ]]; then
+				echo "push \"dhcp-option DNS $line\"" >> /etc/openvpn/server.conf
+			fi
 		done
 		;;
 		2) 
@@ -307,7 +316,8 @@ ifconfig-pool-persist ipp.txt" > /etc/openvpn/server.conf
 		echo 'push "dhcp-option DNS 64.6.65.6"' >> /etc/openvpn/server.conf
 		;;
 	esac
-	echo "keepalive 10 120
+	echo "push \"topology subnet\"
+keepalive 10 120
 cipher AES-256-CBC
 comp-lzo
 user nobody
@@ -316,7 +326,12 @@ persist-key
 persist-tun
 status openvpn-status.log
 verb 3
-crl-verify crl.pem" >> /etc/openvpn/server.conf
+crl-verify crl.pem
+explicit-exit-notify 1" >> /etc/openvpn/server.conf
+	# explicit-exit-notify only works with UDP, set to 0 for TCP
+	if [[ "$PROTOCOL" = 'tcp' ]]; then
+		sed -i '/^explicit-exit-notify/d' /etc/openvpn/server.conf
+	fi
 	# Enable net.ipv4.ip_forward for the system
 	sed -i '/\<net.ipv4.ip_forward\>/c\net.ipv4.ip_forward=1' /etc/sysctl.conf
 	if ! grep -q "\<net.ipv4.ip_forward\>" /etc/sysctl.conf; then
@@ -334,8 +349,8 @@ crl-verify crl.pem" >> /etc/openvpn/server.conf
 		firewall-cmd --permanent --zone=public --add-port=$PORT/$PROTOCOL
 		firewall-cmd --permanent --zone=trusted --add-source=10.8.0.0/24
 		# Set NAT for the VPN subnet
-		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
-		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
+		firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j MASQUERADE
+		firewall-cmd --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j MASQUERADE
 	else
 		# Needed to use rc.local with some systemd distros
 		if [[ "$OS" = 'debian' && ! -e $RCLOCAL ]]; then
@@ -343,20 +358,17 @@ crl-verify crl.pem" >> /etc/openvpn/server.conf
 exit 0' > $RCLOCAL
 		fi
 		chmod +x $RCLOCAL
-		# Set NAT for the VPN subnet
-		iptables -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP
-		sed -i "1 a\iptables -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j SNAT --to $IP" $RCLOCAL
-		if iptables -L -n | grep -qE '^(REJECT|DROP)'; then
-			# If iptables has at least one REJECT rule, we asume this is needed.
-			# Not the best approach but I can't think of other and this shouldn't
-			# cause problems.
-			iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
-			iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT
-			iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-			sed -i "1 a\iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT" $RCLOCAL
-			sed -i "1 a\iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT" $RCLOCAL
-			sed -i "1 a\iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" $RCLOCAL
-		fi
+		# Set NAT for the VPN subnet - use MASQUERADE for cloud/NAT compatibility
+		iptables -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j MASQUERADE
+		sed -i "1 a\iptables -t nat -A POSTROUTING -s 10.8.0.0/24 ! -d 10.8.0.0/24 -j MASQUERADE" $RCLOCAL
+		# Always add FORWARD and INPUT rules (not just when REJECT/DROP detected)
+		# This ensures VPN traffic can flow through the server
+		iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT
+		iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT
+		iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
+		sed -i "1 a\iptables -I INPUT -p $PROTOCOL --dport $PORT -j ACCEPT" $RCLOCAL
+		sed -i "1 a\iptables -I FORWARD -s 10.8.0.0/24 -j ACCEPT" $RCLOCAL
+		sed -i "1 a\iptables -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" $RCLOCAL
 	fi
 	# If SELinux is enabled and a custom port or TCP was selected, we need this
 	if hash sestatus 2>/dev/null; then
@@ -369,6 +381,14 @@ exit 0' > $RCLOCAL
 				semanage port -a -t openvpn_port_t -p $PROTOCOL $PORT
 			fi
 		fi
+	fi
+	# Add NET_ADMIN capability for OpenVPN 2.4+ (needed after dropping privileges)
+	if pgrep systemd-journal; then
+		mkdir -p /etc/systemd/system/openvpn@server.service.d
+		echo "[Service]
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN" > /etc/systemd/system/openvpn@server.service.d/override.conf
+		systemctl daemon-reload
 	fi
 	# And finally, restart OpenVPN
 	if [[ "$OS" = 'debian' ]]; then
@@ -388,17 +408,16 @@ exit 0' > $RCLOCAL
 		fi
 	fi
 	# Try to detect a NATed connection and ask about it to potential LowEndSpirit users
-	EXTERNALIP=$(wget -4qO- "ipv4.icanhazip.com/")
 	if [[ "$IP" != "$EXTERNALIP" ]]; then
 		echo ""
-		echo "看起来您的服务器是一台具备公网的服务器"
+		echo "检测到服务器可能处于 NAT 环境中（云服务器）"
+		echo "内网 IP: $IP"
+		echo "公网 IP: $EXTERNALIP"
 		echo ""
-		echo "如果您不是在局域网内运行的此脚本，请提供一个公网ip地址给我们"
-		echo "如果不是这样，请忽略这个，并将以下字段删除清空！"
-		read -p "公网IP: " -e -i  $EXTERNALIP USEREXTERNALIP
-		if [[ "$USEREXTERNALIP" != "" ]]; then
-			IP=$USEREXTERNALIP
-		fi
+		echo "SNAT 将使用内网 IP ($IP)，客户端将使用公网 IP ($EXTERNALIP) 连接"
+		CLIENTIP=$EXTERNALIP
+	else
+		CLIENTIP=$IP
 	fi
 	# client-common.txt is created so we have a template to add further users later
 	echo "client
@@ -406,7 +425,7 @@ dev tun
 proto $PROTOCOL
 sndbuf 0
 rcvbuf 0
-remote $IP $PORT
+remote $CLIENTIP $PORT
 resolv-retry infinite
 nobind
 persist-key
